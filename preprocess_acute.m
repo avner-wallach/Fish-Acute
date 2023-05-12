@@ -1,0 +1,137 @@
+function [eod] = preprocess_acute(ifile)
+%PREPROCESS_ACUTE prepare data in 'inputfile' imported from spike2 for analysis
+%   filters voltage trace, segements into opochs and saves in outputfile
+namemap{1,1}='Ch1'; namemap{1,2}='EOD';
+namemap{2,1}='highgain'; namemap{2,2}='V';
+namemap{3,1}='dac0'; namemap{3,2}='motor';
+namemap{4,1}='dac1'; namemap{4,2}='aout';
+%% get channels
+if(~iscell(ifile))
+    inputfile{1}=ifile;
+else
+    inputfile=ifile;
+end
+T=0
+for j=1:numel(inputfile)
+    S=load(inputfile{j});
+
+    fnames=fieldnames(S);
+    for i=1:numel(fnames)
+        s=S.(fnames{i});
+        if(numel(s.title)>0)
+            chname=s.title;
+        else
+            ind=strfind(fnames{i},'_');
+            chname=fnames{i}(ind(end)+1:end);
+        end
+        %replace names
+        ind=find(cellfun(@(x) strcmp(chname,x),namemap(:,1)));
+        if(numel(ind))
+            chname=namemap{ind,2};
+        end
+        if(j==1)
+            if(isfield(s,'times'))
+                cdata.(chname).t=s.times;
+                if(isfield(s,'codes'))
+                    cdata.(chname).c=s.codes(:,1);
+                end
+                if(isfield(s,'level'))
+                    cdata.(chname).c=s.level;
+                end        
+            else %cont data
+                cdata.(chname).v=s.values;
+                cdata.(chname).t=[0:s.interval:s.interval*(numel(s.values)-1)]';
+            end
+        else
+            if(isfield(s,'times'))
+                cdata.(chname).t=[cdata.(chname).t;T+s.times];
+                if(isfield(s,'codes'))
+                    cdata.(chname).c=[cdata.(chname).c; s.codes(:,1)];
+                end
+                if(isfield(s,'level'))
+                    cdata.(chname).c=[cdata.(chname).c;s.level];
+                end        
+            else %cont data
+                cdata.(chname).v=[cdata.(chname).v;s.values];
+                cdata.(chname).t=[cdata.(chname).t;T+[0:s.interval:s.interval*(numel(s.values)-1)]'];
+            end
+        end
+    end
+    T=max(cdata.V.t);
+end
+clear fnames;
+%% EOD sampled signals
+tEOD=cdata.EOD.t;
+data(:,1)=tEOD;
+fnames{1}='t';
+data(:,2)=interp1(cdata.motor.t,cdata.motor.v,tEOD);
+fnames{2}='motor';
+%mimic window
+dt=median(diff(cdata.local.t));
+mwin=round((0.005/dt));
+idx=round(tEOD/dt)*ones(1,mwin+1) + ones(size(tEOD))*[0:mwin];
+data(:,3)=max(cdata.local.v(idx),[],2);
+fnames{3}='local';
+data(:,4)=max(cdata.global.v(idx),[],2);
+fnames{4}='global';
+%% LFP
+dt=median(diff(cdata.V.t));
+lwin=[round(0.005/dt):round(0.025/dt)];
+idx=round(tEOD/dt)*ones(1,numel(lwin)) + ones(size(tEOD))*lwin;
+traces=cdata.V.v(idx);
+data(:,5)=max(traces,[],2)-min(traces,[],2);
+fnames{5}='lfp';
+%% HPF for spikes
+hp = designfilt('highpassiir','FilterOrder',8, ...
+        'HalfPowerFrequency',200, ...
+         'SampleRate',1/dt);
+[b_hp,a_hp]=tf(hp);
+V=filtfilt(b_hp,a_hp,cdata.V.v); % zero-phase HPF
+%% blanking
+bwin=[round(-0.0005/dt):round(0.008/dt)];
+idx=round(tEOD/dt)*ones(1,numel(bwin)) + ones(size(tEOD))*bwin;
+idx(idx<=0 | idx>numel(V))=[];
+V(idx)=0;
+%% spike detection
+th=5*std(V);
+ind=find(diff(V<-th)==1);
+reftime=round(0.001/dt);
+if(numel(ind))
+    %clean possible spikes to get rid of duplicates
+    chkspikes=ind(find(diff(ind)<reftime)+1); %index of possible problems
+    gdspikes=setdiff(ind,chkspikes); %index of good spikes
+    for i=2:numel(chkspikes)
+        m=chkspikes(i)-gdspikes;
+        if(min(m(m>0))>reftime) %last good spike is beyond ref time
+            gdspikes=union(gdspikes,chkspikes(i)); %add spike to good spikes
+        end
+    end
+    ind=gdspikes(:);
+end
+
+tsp=cdata.V.t(ind);
+spwin=[round(-0.0005/dt):round(0.0015/dt)];
+ind(ind<-spwin(1) | (ind+spwin(end))>=numel(cdata.V.t))=[];
+idx=ind*ones(1,numel(spwin)) + ones(size(ind))*spwin;
+spikes=V(idx);
+%% raster
+rwin=[0.008 0.060];
+rast=[];
+for i=1:numel(tEOD)
+    ind=find(inrange(tsp-tEOD(i),rwin));
+    rast=[rast;tsp(ind)-tEOD(i) i*ones(numel(ind),1)];
+    data(i,6)=numel(ind);
+end
+fnames{6}='sc1';
+%% events
+events=[cdata.Keyboard.t double(cdata.Keyboard.c) ; cdata.block.t double(cdata.block.c)];
+events=sortrows(events,1);
+%% export
+eod.data=data;
+eod.fnames=fnames;
+eod.events=events;
+eod.rast=rast;
+eod.spikes=spikes;
+eod.traces=traces;
+eod.files=inputfile;
+end
